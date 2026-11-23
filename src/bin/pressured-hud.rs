@@ -1,22 +1,24 @@
-// pressured-hud — a hotkey-summoned GTK4 control window for the pressured daemon.
+// pressured-hud — the control window for the pressured daemon.
 //
 // Thin client: all privilege lives in the daemon, reached over /run/pressured.sock.
 // This binary renders live state and sends list/act requests. Build with:
 //   cargo build --release --features hud
 //
-// Design: an htop-dense, theme-blending control panel. Rows are compact,
-// selectable status lines with a per-app memory meter; a fixed bottom action bar
-// operates on the selected app so buttons never move or truncate. Rows update in
-// place and only re-sort while the pointer is outside the window, so nothing
-// jumps under the cursor. Colour is confined to the data layer (good/warn/crit
-// meters); everything else defers to the system (Yaru/Adwaita) theme.
+// Design: a native GNOME (libadwaita) window in the steel-grey of the shell's own
+// prompts. A status block says in plain words what the machine is doing; three
+// cards show memory, swap and the last minute of pressure; the apps are a boxed
+// list with each app's real icon and name, and the actions for an app appear on
+// the row you point at or select. Rows update in place and only re-sort while the
+// pointer is outside the list, so nothing moves under the cursor. Every colour is
+// an Adwaita palette colour, so it follows light and dark.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -45,13 +47,38 @@ struct App {
     hog: bool,
 }
 
+/// How an app is shown: its real name and icon where a desktop file names it.
+#[derive(Clone)]
+struct Look {
+    title: String,
+    kind: Option<String>,
+    icon: Icon,
+}
+
+#[derive(Clone)]
+enum Icon {
+    Named(String),
+    File(PathBuf),
+}
+
 #[derive(Clone)]
 struct Row {
     root: gtk::ListBoxRow,
-    name: gtk::Label,
+    icon: gtk::Image,
+    title: gtk::Label,
+    subtitle: gtk::Label,
     meter: gtk::ProgressBar,
-    mem: gtk::Label,
-    chip: gtk::Label,
+    badge: gtk::Label,
+    btn_pin: gtk::Button,
+    btn_cap: gtk::Button,
+    btn_pause: gtk::Button,
+    btn_close: gtk::Button,
+}
+
+struct Stat {
+    value: gtk::Label,
+    detail: gtk::Label,
+    meter: gtk::ProgressBar,
 }
 
 fn call(req: &serde_json::Value) -> Option<serde_json::Value> {
@@ -67,12 +94,14 @@ fn human_bytes(b: u64) -> String {
     const G: f64 = (1024 * 1024 * 1024) as f64;
     const M: f64 = (1024 * 1024) as f64;
     let bf = b as f64;
-    if bf >= G {
-        format!("{:.1}G", bf / G)
+    if bf >= 10.0 * G {
+        format!("{:.0} GB", bf / G)
+    } else if bf >= G {
+        format!("{:.1} GB", bf / G)
     } else if bf >= M {
-        format!("{:.0}M", bf / M)
+        format!("{:.0} MB", bf / M)
     } else {
-        format!("{}B", b)
+        format!("{} B", b)
     }
 }
 
@@ -81,20 +110,20 @@ fn ago_str(secs: u64) -> String {
     if secs < 45 {
         "just now".to_string()
     } else if secs < 5400 {
-        format!("{}m ago", (secs + 30) / 60)
+        format!("{} min ago", (secs + 30) / 60)
     } else {
-        format!("{}h ago", (secs + 1800) / 3600)
+        format!("{} h ago", (secs + 1800) / 3600)
     }
 }
 
-fn set_sev(w: &impl IsA<gtk::Widget>, sev: &str) {
+fn set_level(w: &impl IsA<gtk::Widget>, level: &str) {
     for c in ["good", "warn", "crit"] {
         w.remove_css_class(c);
     }
-    w.add_css_class(sev);
+    w.add_css_class(level);
 }
 
-fn share_sev(share: f64) -> &'static str {
+fn share_level(share: f64) -> &'static str {
     if share > 0.20 {
         "crit"
     } else if share > 0.10 {
@@ -104,140 +133,322 @@ fn share_sev(share: f64) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------- naming ----
+
+/// Undo systemd's unit-name escaping (\x2d -> '-').
+fn unescape_unit(s: &str) -> String {
+    let mut out = String::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1] == b'x' {
+            if let Ok(v) = u8::from_str_radix(&s[i + 2..i + 4], 16) {
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn strip_pid(s: &str) -> &str {
+    match s.rfind('-') {
+        Some(p) if !s[p + 1..].is_empty() && s[p + 1..].chars().all(|c| c.is_ascii_digit()) => &s[..p],
+        _ => s,
+    }
+}
+
+/// Desktop-file ids a cgroup unit could belong to, most likely first.
+fn desktop_candidates(unit: &str) -> Vec<String> {
+    let raw = unescape_unit(
+        unit.trim_end_matches(".scope").trim_end_matches(".service").trim_end_matches(".slice"),
+    );
+    let mut out = Vec::new();
+    if let Some(rest) = raw.strip_prefix("snap.") {
+        let mut parts = rest.split('.');
+        if let (Some(snap), Some(app)) = (parts.next(), parts.next()) {
+            let app = app.split('-').next().unwrap_or(app);
+            out.push(format!("{snap}_{app}"));
+            out.push(format!("{snap}_{snap}"));
+        }
+        return out;
+    }
+    let body = ["app-gnome-", "app-vicinae-", "app-flatpak-", "app-kde-", "app-"]
+        .iter()
+        .find_map(|p| raw.strip_prefix(p))
+        .unwrap_or(&raw);
+    let body = body.split('@').next().unwrap_or(body);
+    let id = strip_pid(body);
+    out.push(id.to_string());
+    out.push(id.to_lowercase());
+    if let Some(last) = id.rsplit('.').next() {
+        out.push(last.to_lowercase());
+    }
+    out
+}
+
+fn data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    dirs.push(
+        std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".local/share")),
+    );
+    let sys = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+    for d in sys.split(':').filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(d));
+    }
+    for d in [
+        format!("{home}/.local/share/flatpak/exports/share"),
+        "/var/lib/flatpak/exports/share".to_string(),
+        "/var/lib/snapd/desktop".to_string(),
+        "/usr/local/share".to_string(),
+        "/usr/share".to_string(),
+    ] {
+        let p = PathBuf::from(d);
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
+/// Name and icon from a desktop file, if one exists for this id.
+fn read_desktop(id: &str, dirs: &[PathBuf]) -> Option<(String, Option<String>)> {
+    for d in dirs {
+        let path = d.join("applications").join(format!("{id}.desktop"));
+        if !path.is_file() {
+            continue;
+        }
+        let kf = glib::KeyFile::new();
+        if kf.load_from_file(&path, glib::KeyFileFlags::NONE).is_err() {
+            continue;
+        }
+        let name = kf.locale_string("Desktop Entry", "Name", None).ok()?.to_string();
+        let icon = kf.string("Desktop Entry", "Icon").ok().map(|s| s.to_string());
+        return Some((name, icon));
+    }
+    None
+}
+
+/// Docker container names by full id, refreshed every 15 s (the CLI works for
+/// members of the docker group; without it, containers keep their short id).
+struct DockerNames {
+    at: Option<Instant>,
+    names: HashMap<String, String>,
+}
+
+impl DockerNames {
+    fn get(&mut self, id: &str) -> Option<String> {
+        if self.at.is_none_or(|t| t.elapsed() > Duration::from_secs(15)) {
+            self.at = Some(Instant::now());
+            self.names.clear();
+            if let Ok(out) = std::process::Command::new("docker")
+                .args(["ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"])
+                .stderr(std::process::Stdio::null())
+                .output()
+            {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Some((cid, name)) = line.split_once('\t') {
+                        self.names.insert(cid.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+        self.names.get(id).cloned()
+    }
+}
+
+struct Namer {
+    dirs: Vec<PathBuf>,
+    cache: HashMap<String, Option<(String, Option<String>)>>,
+    docker: DockerNames,
+}
+
+impl Namer {
+    fn new() -> Self {
+        Namer {
+            dirs: data_dirs(),
+            cache: HashMap::new(),
+            docker: DockerNames { at: None, names: HashMap::new() },
+        }
+    }
+
+    fn desktop(&mut self, id: &str) -> Option<(String, Option<String>)> {
+        if let Some(hit) = self.cache.get(id) {
+            return hit.clone();
+        }
+        let found = read_desktop(id, &self.dirs);
+        self.cache.insert(id.to_string(), found.clone());
+        found
+    }
+
+    fn look(&mut self, a: &App) -> Look {
+        let unit = a.id.rsplit('/').next().unwrap_or(&a.id).to_string();
+        let raw = unescape_unit(&unit);
+        let icon_for = |name: Option<String>| match name {
+            Some(n) if n.starts_with('/') => Icon::File(PathBuf::from(n)),
+            Some(n) => Icon::Named(n),
+            None => Icon::Named("system-run-symbolic".into()),
+        };
+        // Agents T3 Code runs: one scope per session.
+        for (prefix, title) in [("t3code-claude-", "Claude agent"), ("t3code-acp-", "Agent"),
+                                ("t3code-codex-", "Codex agent")] {
+            if raw.starts_with(prefix) {
+                let icon = self.desktop("com.t3tools.T3Code").and_then(|d| d.1);
+                return Look { title: title.into(), kind: Some("T3 Code".into()), icon: icon_for(icon) };
+            }
+        }
+        if let Some(cid) = raw.strip_prefix("docker-").map(|s| s.trim_end_matches(".scope")) {
+            let name = self.docker.get(cid).unwrap_or_else(|| format!("Container {}", &cid[..cid.len().min(12)]));
+            return Look {
+                title: name,
+                kind: Some("Docker container".into()),
+                icon: Icon::Named("package-x-generic-symbolic".into()),
+            };
+        }
+        for cand in desktop_candidates(&unit) {
+            if let Some((name, icon)) = self.desktop(&cand) {
+                return Look { title: name, kind: None, icon: icon_for(icon) };
+            }
+        }
+        Look { title: a.name.clone(), kind: None, icon: icon_for(None) }
+    }
+}
+
+// ------------------------------------------------------------------- CSS ----
+
+const CSS: &str = "
+/* The shell's own prompts: dialog grey, slate accent (all Adwaita palette). */
+window.rtux {
+  background-color: var(--dialog-bg-color);
+  color: var(--dialog-fg-color);
+  --accent-bg-color: var(--accent-slate);
+}
+window.rtux headerbar { background: transparent; box-shadow: none; }
+
+.status-icon {
+  min-width: 48px; min-height: 48px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.14);
+}
+.status-icon.good { color: var(--success-color); }
+.status-icon.warn { color: var(--warning-color); }
+.status-icon.crit { color: var(--error-color); }
+.status-title { font-weight: 800; font-size: 1.35em; }
+
+.stat { padding: 12px 14px; border-radius: 12px; }
+.stat .stat-caption { font-size: 0.8em; font-weight: 700; opacity: 0.6; }
+.stat .stat-value { font-size: 1.45em; font-weight: 800; font-feature-settings: 'tnum' 1; }
+.stat .stat-detail { font-size: 0.85em; opacity: 0.6; font-feature-settings: 'tnum' 1; }
+
+progressbar.level, progressbar.level > trough, progressbar.level > trough > progress { min-height: 6px; }
+progressbar.level > trough { border-radius: 99px; background-color: alpha(currentColor, 0.10); }
+progressbar.level > trough > progress { border-radius: 99px; transition: background-color 400ms ease; }
+progressbar.level.good > trough > progress { background-color: var(--success-bg-color); }
+progressbar.level.warn > trough > progress { background-color: var(--warning-bg-color); }
+progressbar.level.crit > trough > progress { background-color: var(--error-bg-color); }
+
+.activity { font-size: 0.85em; opacity: 0.6; }
+.section-title { font-weight: 700; }
+.section-detail { opacity: 0.6; font-feature-settings: 'tnum' 1; }
+
+/* GTK's default progress bar is 150px wide; a row's share bar is a glance. */
+progressbar.row-meter, progressbar.row-meter > trough { min-width: 56px; }
+.apps > row { padding: 8px 10px 8px 12px; transition: background-color 160ms ease; }
+.apps > row .app-title { font-weight: 600; }
+.apps > row .app-subtitle { font-size: 0.88em; opacity: 0.6; font-feature-settings: 'tnum' 1; }
+.apps > row.frozen .app-icon, .apps > row.frozen .app-title { opacity: 0.55; }
+.apps > row .row-actions { opacity: 0; transition: opacity 140ms ease; }
+.apps > row:hover .row-actions, .apps > row:selected .row-actions, .apps > row:focus-within .row-actions { opacity: 1; }
+.apps > row:selected { background-color: alpha(currentColor, 0.08); }
+.row-actions button { min-width: 30px; min-height: 30px; padding: 0; }
+.row-actions button.danger:hover { color: var(--error-color); background-color: alpha(var(--error-color), 0.14); }
+
+.badge { font-size: 0.75em; font-weight: 700; padding: 2px 8px; border-radius: 99px;
+         background-color: alpha(currentColor, 0.12); }
+.badge.paused { color: var(--accent-color); }
+.badge.pinned { color: var(--accent-color); }
+.badge.system { opacity: 0.7; }
+.badge.top    { color: var(--warning-color); }
+";
+
+// -------------------------------------------------------------------- UI ----
+
 fn main() {
-    // adw::Application initialises libadwaita (loads its stylesheet + accent /
-    // dark handling). Step 1 of the migration keeps the existing gtk widgets and
-    // CSS — the point is to verify our bespoke styling survives Adwaita's base
-    // before adopting native chrome.
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run_with_args::<&str>(&[]);
 }
 
-const CSS: &str = "
-.caption { font-size: 0.82em; opacity: 0.6; letter-spacing: 0.3px; }
-.mono { font-family: monospace; font-feature-settings: 'tnum' 1; }
-.hog .appname { font-weight: 800; }
-
-/* meters — rounded with a little depth and smooth colour transitions */
-progressbar.meter, progressbar.meter > trough, progressbar.meter > trough > progress { min-height: 7px; }
-progressbar.meter > trough {
-  border-radius: 6px;
-  background: alpha(@theme_fg_color, 0.10);
-}
-progressbar.meter > trough > progress {
-  border-radius: 6px;
-  transition: background-color 400ms ease, box-shadow 400ms ease;
-}
-progressbar.meter.good > trough > progress { background-image: linear-gradient(to right, #56b84a, #6fd063); }
-progressbar.meter.warn > trough > progress { background-image: linear-gradient(to right, #d99a33, #edb85a); }
-progressbar.meter.crit > trough > progress {
-  background-image: linear-gradient(to right, #e2504a, #f26a63);
-  box-shadow: 0 0 7px alpha(#e2504a, 0.55);
+fn label(text: &str, classes: &[&str]) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.set_xalign(0.0);
+    for c in classes {
+        l.add_css_class(c);
+    }
+    l
 }
 
-/* list rows — breathing room, hover + accent selection, smooth */
-.hud-list { background: transparent; }
-.hud-list > row {
-  border-radius: 10px;
-  padding: 7px 12px;
-  margin: 1px 2px;
-  transition: background-color 160ms ease, opacity 300ms ease;
-}
-.hud-list > row:hover { background: alpha(@theme_fg_color, 0.05); }
-.hud-list > row:selected {
-  /* override the theme's solid-accent selection with a soft tint + edge bar */
-  background-image: none;
-  background-color: alpha(#e95420, 0.16);
-  box-shadow: inset 3px 0 0 #e95420;
-  color: @theme_fg_color;
-}
-/* frozen apps read as 'on ice' — dimmed + italic (a nod to the frost vision) */
-.hud-list > row.frozen { opacity: 0.5; }
-.hud-list > row.frozen .appname { font-style: italic; }
-
-.pword { font-size: 1.05em; }
-.pword.good { color: #6fd063; font-weight: 800; }
-.pword.warn { color: #edb85a; font-weight: 800; }
-.pword.crit { color: #f26a63; font-weight: 800; }
-
-.chip { font-size: 0.72em; padding: 2px 9px; border-radius: 8px; font-weight: 600; }
-.chip.live   { color: #7ad06e; background: alpha(#63c257, 0.14); }
-.chip.paused { color: #ecc06a; background: alpha(#e0a53b, 0.18); }
-.chip.pinned { color: #6fb8f0; background: alpha(#57a5e6, 0.18); }
-.chip.locked { color: alpha(@theme_fg_color, 0.6); background: alpha(@theme_fg_color, 0.09); }
-
-.actionbar {
-  border-top: 1px solid alpha(@theme_fg_color, 0.08);
-  margin-top: 4px;
-  padding-top: 12px;
-}
-.actionbar .selname { font-weight: 600; }
-
-/* the recent-activity trail: quiet, secondary, sits just under the card */
-.activity {
-  font-size: 0.80em;
-  opacity: 0.55;
-  margin: -2px 4px 2px 4px;
-  letter-spacing: 0.2px;
+fn level_bar() -> gtk::ProgressBar {
+    let pb = gtk::ProgressBar::new();
+    pb.set_show_text(false);
+    pb.set_hexpand(true);
+    pb.set_valign(gtk::Align::Center);
+    pb.add_css_class("level");
+    pb.add_css_class("good");
+    pb
 }
 
-/* header reads as a calm instrument panel, not a form */
-.statuscard {
-  padding: 12px 14px;
-  border-radius: 14px;
-  background-image: linear-gradient(to bottom,
-    alpha(@theme_fg_color, 0.05), alpha(@theme_fg_color, 0.015));
-  border: 1px solid alpha(@theme_fg_color, 0.06);
+/// A stat card: caption, big value, detail, and a level bar (or a sparkline).
+fn stat_card(caption: &str, help: &str) -> (gtk::Box, Stat) {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    card.add_css_class("card");
+    card.add_css_class("stat");
+    card.set_hexpand(true);
+    card.set_tooltip_text(Some(help));
+    card.append(&label(caption, &["stat-caption"]));
+    let value = label("—", &["stat-value"]);
+    let detail = label("", &["stat-detail"]);
+    detail.set_ellipsize(pango::EllipsizeMode::End);
+    let meter = level_bar();
+    meter.set_margin_top(6);
+    card.append(&value);
+    card.append(&detail);
+    card.append(&meter);
+    (card, Stat { value, detail, meter })
 }
-/* the hero sentence: quiet when all is well (calm tech), colour only on escalation */
-.statusline {
-  font-size: 1.28em;
-  font-weight: 800;
-  letter-spacing: 0.2px;
-  margin-bottom: 2px;
-  transition: color 500ms ease;
-}
-.statusline.good { color: alpha(@theme_fg_color, 0.88); }
-.statusline.warn { color: #edb85a; }
-.statusline.crit { color: #f26a63; }
 
-/* frozen apps don't just dim — they slowly 'breathe' like they're asleep on ice
-   (the vetoable-frost vision, brought into the HUD), with a faint cold tint */
-@keyframes frostbreathe {
-  0%   { opacity: 0.40; }
-  50%  { opacity: 0.58; }
-  100% { opacity: 0.40; }
+fn icon_button(icon: &str, tip: &str) -> gtk::Button {
+    let b = gtk::Button::from_icon_name(icon);
+    b.add_css_class("flat");
+    b.add_css_class("circular");
+    b.set_valign(gtk::Align::Center);
+    b.set_tooltip_text(Some(tip));
+    b.update_property(&[gtk::accessible::Property::Label(tip)]);
+    b
 }
-.hud-list > row.frozen {
-  animation: frostbreathe 3.2s ease-in-out infinite;
-  background-image: linear-gradient(to right,
-    alpha(#8fbfe6, 0.12), alpha(#8fbfe6, 0.02));
-}
-";
 
 fn build_ui(app: &adw::Application) {
     // Re-summoning the HUD *recreates* the window rather than present()ing the
-    // existing one. On Wayland, focusing an already-mapped toplevel requires an
-    // xdg-activation token, and GNOME custom-keybindings spawn their command with
-    // none (verified: XDG_ACTIVATION_TOKEN is always unset) — so present() can't
-    // raise it. A freshly *mapped* toplevel, by contrast, gets initial focus.
-    // The HUD is a stateless live view of the daemon, so tearing it down and
-    // rebuilding is free and always lands focused. (A shell extension could focus
-    // directly, but that needs a login the user has ruled out.)
+    // existing one: on Wayland a GNOME custom keybinding spawns us with no
+    // activation token, so present() couldn't raise a mapped window, while a
+    // freshly mapped one gets focus. The HUD is a stateless view of the daemon.
     for win in app.windows() {
         win.destroy();
     }
-    // Claim this build's generation; the old window's refresh timer sees a newer
-    // value on its next tick and terminates itself.
-    let my_gen =
-        HUD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let my_gen = HUD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // Developer aid: render the window to a PNG and quit, with no keys or actions.
+    let snapshot_to = std::env::var("PRESSURED_HUD_SNAPSHOT").ok();
 
     // Ask the daemon to keep us resident + OOM-protected so the control surface
     // stays operable exactly when it's needed most (under heavy pressure).
     let _ = call(&serde_json::json!({"cmd": "pin_self", "pid": std::process::id()}));
 
-    // Install the stylesheet once per process — re-activations reuse it.
     static CSS_ONCE: std::sync::Once = std::sync::Once::new();
     CSS_ONCE.call_once(|| {
         let provider = gtk::CssProvider::new();
@@ -251,32 +462,99 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    root.set_margin_top(12);
-    root.set_margin_bottom(10);
-    root.set_margin_start(12);
-    root.set_margin_end(12);
+    // ---- window chrome ----
+    let title = adw::WindowTitle::new("Memory", "Checking\u{2026}");
+    let header_bar = adw::HeaderBar::new();
+    header_bar.set_title_widget(Some(&title));
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header_bar);
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .default_width(560)
+        .default_height(680)
+        .content(&toolbar)
+        .build();
+    window.set_title(Some("Memory \u{b7} rtux"));
+    window.add_css_class("rtux");
 
-    // ---- header: pressure + RAM + swap meters ----
-    let (header, status, pword, pspark, pspark_data, ram_lbl, ram_meter, swap_lbl, swap_meter) =
-        build_header();
-    root.append(&header);
+    // ---- content ----
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    content.set_margin_top(6);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
 
-    // A muted trail of what rtux recently did — witnessed history is how trust
-    // accrues (DESIGN.md). Hidden until there's something to show.
-    let activity = gtk::Label::new(None);
-    activity.add_css_class("caption");
-    activity.add_css_class("activity");
-    activity.set_xalign(0.0);
-    activity.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    activity.set_visible(false);
-    root.append(&activity);
+    // status: icon in a tinted circle + a plain sentence + the detail
+    let status_box = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    let status_icon = gtk::Image::from_icon_name("emblem-ok-symbolic");
+    status_icon.set_pixel_size(24);
+    status_icon.add_css_class("status-icon");
+    status_icon.add_css_class("good");
+    status_icon.set_valign(gtk::Align::Center);
+    let status_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    status_text.set_valign(gtk::Align::Center);
+    let status_title = label("Checking\u{2026}", &["status-title"]);
+    status_title.set_wrap(true);
+    let status_detail = label("", &["dim-label"]);
+    status_detail.set_wrap(true);
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    status_box.append(&status_icon);
+    status_box.append(&status_text);
+    content.append(&status_box);
 
-    // ---- app list (boxed, scrolled) ----
+    // three stat cards
+    let cards = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    cards.set_homogeneous(true);
+    let (ram_card, ram) = stat_card("MEMORY", "Fast memory (RAM) in use, out of the total.");
+    let (swap_card, swap) = stat_card(
+        "SWAP",
+        "Backup memory used when RAM fills up. Some is compressed and still quick; \
+         some is on disk and slow.",
+    );
+    let (press_card, press) = stat_card(
+        "PRESSURE",
+        "How hard the computer is working to find free memory, over the last minute. \
+         The faint line marks where it would start to stutter.",
+    );
+    // Pressure card: the sparkline in place of a level bar.
+    press.meter.set_visible(false);
+    let (spark, spark_data) = sparkline();
+    spark.set_margin_top(2);
+    press_card.append(&spark);
+    cards.append(&ram_card);
+    cards.append(&swap_card);
+    cards.append(&press_card);
+    content.append(&cards);
+
+    // what rtux recently did, quietly
+    let activity_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    activity_box.add_css_class("activity");
+    let activity_icon = gtk::Image::from_icon_name("document-open-recent-symbolic");
+    let activity = label("", &[]);
+    activity.set_ellipsize(pango::EllipsizeMode::End);
+    activity.set_hexpand(true);
+    activity_box.append(&activity_icon);
+    activity_box.append(&activity);
+    activity_box.set_visible(false);
+    content.append(&activity_box);
+
+    // apps header
+    let apps_head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    apps_head.set_margin_top(4);
+    let apps_title = label("Apps", &["section-title"]);
+    apps_title.set_hexpand(true);
+    let apps_detail = label("", &["section-detail"]);
+    apps_head.append(&apps_title);
+    apps_head.append(&apps_detail);
+    content.append(&apps_head);
+
+    // apps list
     let list = gtk::ListBox::new();
-    list.add_css_class("hud-list");
+    list.add_css_class("boxed-list");
+    list.add_css_class("apps");
     list.set_selection_mode(gtk::SelectionMode::Single);
-
+    list.set_valign(gtk::Align::Start);
     let mems: Rc<RefCell<HashMap<String, u64>>> = Rc::new(RefCell::new(HashMap::new()));
     {
         let mems = mems.clone();
@@ -287,16 +565,12 @@ fn build_ui(app: &adw::Application) {
             mb.cmp(&ma).into()
         });
     }
-
-    let frame = gtk::Frame::new(None);
-    frame.set_child(Some(&list));
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .min_content_height(340)
         .vexpand(true)
-        .child(&frame)
+        .child(&list)
         .build();
-    root.append(&scroller);
+    content.append(&scroller);
 
     // Freeze re-sorting while the pointer is inside, so rows hold still to click.
     let hovering = Rc::new(Cell::new(false));
@@ -309,148 +583,142 @@ fn build_ui(app: &adw::Application) {
         scroller.add_controller(motion);
     }
 
-    // ---- bottom action bar (operates on the selected row) ----
-    let (bar, sel_lbl, btn_pause, btn_cap, btn_pin, btn_close) = build_action_bar();
-    root.append(&bar);
-
-    // Native GNOME chrome: an integrated flat headerbar (window controls live in
-    // it, no separate title bar) over the content, via AdwToolbarView. The
-    // headerbar is flat so it blends into the instrument-panel look.
-    let header_bar = adw::HeaderBar::new();
-    header_bar.add_css_class("flat");
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header_bar);
-    toolbar.set_content(Some(&root));
-
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .default_width(560)
-        .default_height(560)
-        .content(&toolbar)
+    // unreachable: a proper status page instead of the panel
+    let retry = gtk::Button::with_label("Try Again");
+    retry.add_css_class("pill");
+    retry.set_halign(gtk::Align::Center);
+    let unreachable = adw::StatusPage::builder()
+        .icon_name("network-offline-symbolic")
+        .title("Can't Reach rtux")
+        .description(
+            "The pressured service isn't running, or this account can't open its \
+             control socket. Check it with: systemctl status rtux.service",
+        )
+        .child(&retry)
         .build();
-    window.set_title(Some("pressured"));
 
-    // Esc dismisses (daemon keeps running).
-    {
-        let key = gtk::EventControllerKey::new();
-        let w = window.clone();
-        key.connect_key_pressed(move |_, k, _, _| {
-            if k == gtk::gdk::Key::Escape {
-                w.close();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-        window.add_controller(key);
-    }
+    let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.add_named(&content, Some("panel"));
+    stack.add_named(&unreachable, Some("unreachable"));
+    toolbar.set_content(Some(&stack));
 
     // ---- shared state ----
     let rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
     let apps: Rc<RefCell<HashMap<String, App>>> = Rc::new(RefCell::new(HashMap::new()));
+    let looks: Rc<RefCell<HashMap<String, Look>>> = Rc::new(RefCell::new(HashMap::new()));
     let selected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let namer = Rc::new(RefCell::new(Namer::new()));
+    let refresh_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let do_refresh = {
+        let cell = refresh_cell.clone();
+        move || {
+            let r = cell.borrow().clone();
+            if let Some(r) = r {
+                r();
+            }
+        }
+    };
 
-    // Reflect the selected app onto the action bar.
-    let sync_bar: Rc<dyn Fn()> = {
+    // ---- actions (pin / cap / pause / close), for any row ----
+    let act: Rc<dyn Fn(&str, &str)> = {
         let apps = apps.clone();
-        let selected = selected.clone();
-        let sel_lbl = sel_lbl.clone();
-        let btn_pause = btn_pause.clone();
-        let btn_cap = btn_cap.clone();
-        let btn_pin = btn_pin.clone();
-        let btn_close = btn_close.clone();
-        Rc::new(move || {
-            let sel = selected.borrow().clone();
-            match sel.and_then(|id| apps.borrow().get(&id).cloned()) {
-                Some(a) => {
-                    sel_lbl.set_text(&a.name);
-                    btn_pause.set_label(if a.frozen { "Resume" } else { "Pause" });
-                    btn_pause.set_tooltip_text(Some(if a.frozen {
-                        "Resume (P): wake this paused app exactly where it left off."
-                    } else {
-                        "Pause (P): freeze this app so it stops running and can't use more memory. Reversible."
-                    }));
-                    btn_pause.set_sensitive(a.freezable || a.frozen);
-                    btn_cap.set_sensitive(a.freezable);
-                    btn_pin.set_label(if a.protected { "Unpin" } else { "Pin" });
-                    btn_pin.set_tooltip_text(Some(if a.protected {
-                        "Unpin (I): stop keeping this app in fast memory."
-                    } else {
-                        "Pin (I): keep this app in fast memory so it always stays quick."
-                    }));
-                    btn_pin.set_sensitive(true);
-                    btn_close.set_sensitive(a.freezable);
+        let looks = looks.clone();
+        let window = window.clone();
+        let do_refresh = do_refresh.clone();
+        let snapshot = snapshot_to.is_some();
+        Rc::new(move |action: &str, id: &str| {
+            if snapshot {
+                return;
+            }
+            let Some(a) = apps.borrow().get(id).cloned() else { return };
+            let send = {
+                let id = id.to_string();
+                let do_refresh = do_refresh.clone();
+                move |resolved: &str| {
+                    let _ = call(&serde_json::json!({"cmd": "act", "action": resolved, "id": id}));
+                    do_refresh();
                 }
-                None => {
-                    sel_lbl.set_text("Select an app to act on it");
-                    for b in [&btn_pause, &btn_cap, &btn_pin, &btn_close] {
-                        b.set_sensitive(false);
-                    }
+            };
+            match action {
+                "pause" => send(if a.frozen { "thaw" } else { "freeze" }),
+                "pin" => send(if a.protected { "unprotect" } else { "protect" }),
+                "cap" => send("cap"),
+                "kill" => {
+                    // The one action that can't be undone: always confirm.
+                    let name = looks.borrow().get(id).map(|l| l.title.clone()).unwrap_or(a.name.clone());
+                    let dialog = adw::AlertDialog::new(
+                        Some(&format!("Close {name}?")),
+                        Some("It stops right away, and anything unsaved in it is lost. \
+                              Pausing it instead can be undone."),
+                    );
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("close", "Close");
+                    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    dialog.connect_response(None, move |_, resp| {
+                        if resp == "close" {
+                            send("kill");
+                        }
+                    });
+                    dialog.present(Some(&window));
                 }
+                _ => {}
             }
         })
     };
 
     {
         let selected = selected.clone();
-        let sync_bar = sync_bar.clone();
         list.connect_row_selected(move |_, row| {
             *selected.borrow_mut() = row.map(|r| r.widget_name().to_string());
-            sync_bar();
         });
     }
 
     // ---- refresh: update everything in place ----
     let refresh: Rc<dyn Fn()> = {
         let list = list.clone();
+        let stack = stack.clone();
         let rows = rows.clone();
         let apps = apps.clone();
+        let looks = looks.clone();
         let mems = mems.clone();
         let selected = selected.clone();
         let hovering = hovering.clone();
-        let sync_bar = sync_bar.clone();
-        let status = status.clone();
-        let activity = activity.clone();
-        let pword = pword.clone();
-        let pspark = pspark.clone();
-        let pspark_data = pspark_data.clone();
-        let ram_lbl = ram_lbl.clone();
-        let ram_meter = ram_meter.clone();
-        let swap_lbl = swap_lbl.clone();
-        let swap_meter = swap_meter.clone();
+        let namer = namer.clone();
+        let act = act.clone();
+        let title = title.clone();
         Rc::new(move || {
             let reply = match call(&serde_json::json!({"cmd": "list"})) {
                 Some(r) => r,
                 None => {
-                    pword.set_text("daemon unreachable");
-                    set_sev(&pword, "crit");
+                    stack.set_visible_child_name("unreachable");
+                    title.set_subtitle("rtux unreachable");
                     return;
                 }
             };
+            stack.set_visible_child_name("panel");
 
-            // header
+            // pressure, memory, swap
             let some = reply["some_avg10"].as_f64().unwrap_or(0.0);
             let full = reply["full_avg10"].as_f64().unwrap_or(0.0);
-            let (pw, psev) = if some > 25.0 || full > 10.0 {
-                ("critical", "crit")
+            let (pword, plevel) = if some > 25.0 || full > 10.0 {
+                ("Critical", "crit")
             } else if some > 5.0 {
-                ("elevated", "warn")
+                ("Elevated", "warn")
             } else {
-                ("normal", "good")
+                ("Normal", "good")
             };
-            pword.set_text(pw);
-            set_sev(&pword, psev);
-            // Feed the pressure sparkline the rolling history from the daemon
-            // (falls back to just the current sample if the daemon is older).
+            press.value.set_text(pword);
+            press.detail.set_text(&format!("{some:.1}% stalled"));
             {
-                let mut buf = pspark_data.borrow_mut();
+                let mut buf = spark_data.borrow_mut();
                 match reply["pressure_trend"].as_array() {
                     Some(arr) if !arr.is_empty() => {
                         buf.clear();
                         buf.extend(arr.iter().filter_map(|v| v.as_f64()));
                     }
-                    // Older daemon with no history field: accumulate our own so
-                    // the trace still fills while the window stays open.
                     _ => {
                         buf.push(some);
                         let len = buf.len();
@@ -460,184 +728,163 @@ fn build_ui(app: &adw::Application) {
                     }
                 }
             }
-            pspark.queue_draw();
+            spark.queue_draw();
 
             let mem_total = reply["mem_total"].as_u64().unwrap_or(1).max(1);
             let mem_used = reply["mem_used"].as_u64().unwrap_or(0);
             let swap_total = reply["swap_total"].as_u64().unwrap_or(0);
             let swap_used = reply["swap_used"].as_u64().unwrap_or(0);
-            ram_lbl.set_text(&format!("{} / {}", human_bytes(mem_used), human_bytes(mem_total)));
             let ram_frac = mem_used as f64 / mem_total as f64;
-            ram_meter.set_fraction(ram_frac.clamp(0.0, 1.0));
-            set_sev(&ram_meter, if ram_frac > 0.9 { "crit" } else if ram_frac > 0.75 { "warn" } else { "good" });
+            ram.value.set_text(&human_bytes(mem_used));
+            ram.detail.set_text(&format!("of {}", human_bytes(mem_total)));
+            ram.meter.set_fraction(ram_frac.clamp(0.0, 1.0));
+            set_level(&ram.meter, if ram_frac > 0.9 { "crit" } else if ram_frac > 0.75 { "warn" } else { "good" });
             if swap_total > 0 {
-                swap_lbl.set_text(&format!("{} / {}", human_bytes(swap_used), human_bytes(swap_total)));
                 let sf = swap_used as f64 / swap_total as f64;
-                swap_meter.set_fraction(sf.clamp(0.0, 1.0));
-                set_sev(&swap_meter, if sf > 0.8 { "crit" } else if sf > 0.5 { "warn" } else { "good" });
+                swap.value.set_text(&human_bytes(swap_used));
+                swap.detail.set_text(&format!("of {}", human_bytes(swap_total)));
+                swap.meter.set_fraction(sf.clamp(0.0, 1.0));
+                set_level(&swap.meter, if sf > 0.8 { "crit" } else if sf > 0.5 { "warn" } else { "good" });
             } else {
-                swap_lbl.set_text("none");
-                swap_meter.set_fraction(0.0);
+                swap.value.set_text("None");
+                swap.detail.set_text("no swap");
+                swap.meter.set_fraction(0.0);
             }
 
-            // apps
             let parsed = parse_apps(&reply);
 
-            // Truthful status hero: reflect what rtux has actually done. A paused
-            // count comes straight from live state — never a canned "handling it".
-            // When apps are paused the machine is *coping*, so it reads calm
-            // (amber "handled"), not alarm-red; genuine red is high pressure with
-            // nothing paused yet.
+            // The status sentence states only what's true: a paused count comes
+            // from live state. Paused apps mean the machine is coping (amber).
             let paused = parsed.iter().filter(|a| a.frozen).count();
-            let (sentence, ssev) = if paused > 0 {
+            let (sentence, slevel, icon) = if paused > 0 {
                 (
-                    format!(
-                        "Paused {} background app{} to keep you fast",
-                        paused,
-                        if paused == 1 { "" } else { "s" }
-                    ),
+                    format!("Paused {} background app{}", paused, if paused == 1 { "" } else { "s" }),
                     "warn",
+                    "media-playback-pause-symbolic",
                 )
-            } else if psev == "crit" {
-                ("Under heavy load — protecting your foreground".to_string(), "crit")
-            } else if psev == "warn" {
-                ("Getting busy — keeping the foreground quick".to_string(), "warn")
+            } else if plevel == "crit" {
+                ("Under heavy load".to_string(), "crit", "dialog-warning-symbolic")
+            } else if plevel == "warn" {
+                ("Getting busy".to_string(), "warn", "dialog-warning-symbolic")
             } else {
-                ("Running smoothly".to_string(), "good")
+                ("Running smoothly".to_string(), "good", "emblem-ok-symbolic")
             };
-            status.set_text(&sentence);
-            set_sev(&status, ssev);
+            status_title.set_text(&sentence);
+            status_icon.set_icon_name(Some(icon));
+            set_level(&status_icon, slevel);
+            let detail = match slevel {
+                "good" => "Plenty of memory for what you're running. Your foreground app stays fast.".to_string(),
+                _ if paused > 0 => "Paused apps resume by themselves once memory frees up.".to_string(),
+                _ => "rtux keeps your foreground app fast and pauses background ones if needed.".to_string(),
+            };
+            status_detail.set_text(&detail);
+            title.set_subtitle(&sentence);
 
-            // Recent activity trail: "Paused Chrome · 2m ago   ·   Resumed …".
+            // recent activity: "Paused Chrome · 2 min ago"
             if let Some(evs) = reply["recent"].as_array().filter(|a| !a.is_empty()) {
                 let fmt = |e: &serde_json::Value| {
-                    let text = e["text"].as_str().unwrap_or("");
-                    let ago = ago_str(e["ago_secs"].as_u64().unwrap_or(0));
-                    format!("{} · {}", text, ago)
+                    format!(
+                        "{} \u{b7} {}",
+                        e["text"].as_str().unwrap_or(""),
+                        ago_str(e["ago_secs"].as_u64().unwrap_or(0))
+                    )
                 };
-                let line = evs.iter().take(3).map(&fmt).collect::<Vec<_>>().join("    ·    ");
-                activity.set_text(&format!("⟲  {}", line));
-                // Full history on hover, one per line.
-                let full = evs.iter().map(&fmt).collect::<Vec<_>>().join("\n");
-                activity.set_tooltip_text(Some(&full));
-                activity.set_visible(true);
+                activity.set_text(&fmt(&evs[0]));
+                activity_box.set_tooltip_text(Some(&evs.iter().map(&fmt).collect::<Vec<_>>().join("\n")));
+                activity_box.set_visible(true);
             } else {
-                activity.set_visible(false);
+                activity_box.set_visible(false);
             }
+
+            let total_apps: u64 = parsed.iter().map(|a| a.mem).sum();
+            apps_detail.set_text(&format!(
+                "{} app{} \u{b7} {}",
+                parsed.len(),
+                if parsed.len() == 1 { "" } else { "s" },
+                human_bytes(total_apps)
+            ));
 
             let mut seen: HashSet<String> = HashSet::new();
             for a in &parsed {
                 seen.insert(a.id.clone());
                 mems.borrow_mut().insert(a.id.clone(), a.mem);
                 apps.borrow_mut().insert(a.id.clone(), a.clone());
+                let look = looks
+                    .borrow_mut()
+                    .entry(a.id.clone())
+                    .or_insert_with(|| namer.borrow_mut().look(a))
+                    .clone();
                 let mut rows_m = rows.borrow_mut();
                 if let Some(row) = rows_m.get(&a.id) {
-                    update_row(row, a, mem_total);
+                    update_row(row, a, &look, mem_total);
                 } else {
-                    let row = build_row(a, mem_total);
+                    let row = build_row(a, &look, mem_total, &act);
                     list.append(&row.root);
                     rows_m.insert(a.id.clone(), row);
                 }
             }
-
-            // drop vanished apps
-            let gone: Vec<String> = rows
-                .borrow()
-                .keys()
-                .filter(|k| !seen.contains(*k))
-                .cloned()
-                .collect();
+            let gone: Vec<String> = rows.borrow().keys().filter(|k| !seen.contains(*k)).cloned().collect();
             for id in gone {
                 if let Some(row) = rows.borrow_mut().remove(&id) {
                     list.remove(&row.root);
                 }
                 mems.borrow_mut().remove(&id);
                 apps.borrow_mut().remove(&id);
+                looks.borrow_mut().remove(&id);
                 if selected.borrow().as_deref() == Some(id.as_str()) {
                     *selected.borrow_mut() = None;
                 }
             }
-
             if !hovering.get() {
                 list.invalidate_sort();
             }
-            sync_bar();
         })
     };
-
-    // Wire action buttons.
-    let act = {
-        let selected = selected.clone();
-        let apps = apps.clone();
+    *refresh_cell.borrow_mut() = Some(refresh.clone());
+    {
         let refresh = refresh.clone();
-        move |action: &str| {
-            let Some(id) = selected.borrow().clone() else { return };
-            // pause/pin are stateful toggles resolved from current app state
-            let resolved = match action {
-                "pause" => {
-                    let frozen = apps.borrow().get(&id).map(|a| a.frozen).unwrap_or(false);
-                    if frozen { "thaw" } else { "freeze" }
-                }
-                "pin" => {
-                    let prot = apps.borrow().get(&id).map(|a| a.protected).unwrap_or(false);
-                    if prot { "unprotect" } else { "protect" }
-                }
-                other => other,
-            };
-            let _ = call(&serde_json::json!({"cmd": "act", "action": resolved, "id": id}));
-            refresh();
-        }
-    };
-    let act = Rc::new(act);
-    for (btn, name) in [
-        (&btn_pause, "pause"),
-        (&btn_cap, "cap"),
-        (&btn_pin, "pin"),
-        (&btn_close, "kill"),
-    ] {
-        let act = act.clone();
-        let name = name.to_string();
-        btn.connect_clicked(move |_| act(&name));
+        retry.connect_clicked(move |_| refresh());
     }
 
-    // Keyboard shortcuts for the actions (operate on the selected row; the `act`
-    // closure no-ops if nothing is selected). Arrow keys navigate the list
-    // natively; these drive the action bar without reaching for the mouse.
-    {
-        let act = act.clone();
+    // Keys: Esc closes; P/C/I and Delete act on the selected app.
+    if snapshot_to.is_none() {
         let keys = gtk::EventControllerKey::new();
+        let w = window.clone();
+        let selected = selected.clone();
+        let act = act.clone();
         keys.connect_key_pressed(move |_, k, _, _| {
             use gtk::gdk::Key;
+            if k == Key::Escape {
+                w.close();
+                return glib::Propagation::Stop;
+            }
             let hit = match k {
                 Key::p | Key::P => Some("pause"),
                 Key::c | Key::C => Some("cap"),
                 Key::i | Key::I => Some("pin"),
-                // Close is the one irreversible action — deliberate Delete only,
-                // never a bare letter that could be fat-fingered.
+                // Close: deliberate Delete only (and it asks first).
                 Key::Delete => Some("kill"),
                 _ => None,
             };
-            match hit {
-                Some(a) => {
-                    act(a);
+            let id = selected.borrow().clone();
+            match (hit, id) {
+                (Some(a), Some(id)) => {
+                    act(a, &id);
                     glib::Propagation::Stop
                 }
-                None => glib::Propagation::Proceed,
+                _ => glib::Propagation::Proceed,
             }
         });
         window.add_controller(keys);
     }
 
-    // initial paint + 1s live refresh
     refresh();
-    // Preselect the biggest consumer so the HUD is usable by keyboard at once.
     if let Some(row) = list.row_at_index(0) {
         list.select_row(Some(&row));
     }
     {
         let refresh = refresh.clone();
         glib::timeout_add_seconds_local(1, move || {
-            // A newer window superseded us — stop polling and drop our widgets.
             if HUD_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
                 return glib::ControlFlow::Break;
             }
@@ -648,115 +895,61 @@ fn build_ui(app: &adw::Application) {
 
     window.present();
     list.grab_focus();
+
+    if let Some(path) = snapshot_to {
+        let w = window.clone();
+        let app = app.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+            let (width, height) = (w.width(), w.height());
+            let paintable = gtk::WidgetPaintable::new(Some(&w));
+            let snap = gtk::Snapshot::new();
+            paintable.snapshot(&snap, width as f64, height as f64);
+            if let (Some(node), Some(renderer)) = (snap.to_node(), w.renderer()) {
+                let tex = renderer.render_texture(&node, None);
+                let _ = tex.save_to_png(&path);
+            }
+            app.quit();
+        });
+    }
 }
 
-fn build_header() -> (
-    gtk::Box,
-    gtk::Label,
-    gtk::Label,
-    gtk::DrawingArea,
-    Rc<RefCell<Vec<f64>>>,
-    gtk::Label,
-    gtk::ProgressBar,
-    gtk::Label,
-    gtk::ProgressBar,
-) {
-    let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    header.add_css_class("statuscard");
-
-    // The hero: a plain-language sentence of what the machine is doing right now.
-    // Always visible (not hidden in a tooltip) — legibility is the whole point,
-    // and it only ever states what's actually true (paused counts come from live
-    // app state, never a canned claim).
-    let status = gtk::Label::new(Some("Checking…"));
-    status.add_css_class("statusline");
-    status.set_xalign(0.0);
-    status.set_wrap(true);
-    header.append(&status);
-
-    // pressure line
-    let prow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let ptitle = gtk::Label::new(Some("Pressure"));
-    ptitle.add_css_class("caption");
-    ptitle.set_width_request(58);
-    ptitle.set_xalign(0.0);
-    let pword = gtk::Label::new(Some("—"));
-    pword.add_css_class("pword");
-    pword.set_width_request(64);
-    pword.set_xalign(0.0);
-    // A sparkline of the last ~minute of pressure instead of a bare bar, so you
-    // can see it *climbing* toward trouble — the anticipatory read.
-    let (pspark, pspark_data) = sparkline();
-    prow.append(&ptitle);
-    prow.append(&pword);
-    prow.append(&pspark);
-    prow.set_tooltip_text(Some(
-        "How hard your computer is working to find free memory, over the last \
-         minute. The faint line marks the level where it would start to stutter — \
-         so if the trace is climbing toward it, rtux is about to step in.",
-    ));
-    header.append(&prow);
-
-    let (rrow, ram_lbl, ram_meter) = meter_row("RAM");
-    rrow.set_tooltip_text(Some(
-        "Fast memory — in use / total. When it fills up, apps slow down or get paused.",
-    ));
-    let (srow, swap_lbl, swap_meter) = meter_row("Swap");
-    srow.set_tooltip_text(Some(
-        "Backup memory, used when the fast memory fills up. Some is compressed and \
-         still fairly quick; some lives on disk and is slow. In use / total.",
-    ));
-    header.append(&rrow);
-    header.append(&srow);
-
-    (header, status, pword, pspark, pspark_data, ram_lbl, ram_meter, swap_lbl, swap_meter)
-}
-
-/// A pressure sparkline: a filled trace of recent `some.avg10` (percent) over a
-/// fixed 0–50 ceiling, with a faint guide at the critical threshold (25). Colour
-/// follows the current level. Reads the shared data buffer on each redraw.
+/// The last minute of pressure (`some.avg10`, percent) over a 0–50 ceiling, with
+/// a faint guide at the critical level (25), in the Adwaita colour of its level.
 fn sparkline() -> (gtk::DrawingArea, Rc<RefCell<Vec<f64>>>) {
     let data: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
     let area = gtk::DrawingArea::new();
     area.set_hexpand(true);
-    area.set_content_height(24);
-    area.set_valign(gtk::Align::Center);
+    area.set_content_height(28);
     let d = data.clone();
     area.set_draw_func(move |_, cr, w, h| {
         let data = d.borrow();
-        let w = w as f64;
-        let h = h as f64;
-        const CEIL: f64 = 50.0; // avg10 percent; 25 = critical
-        // Inset so a flat, near-zero trace still sits visibly above the bottom
-        // edge rather than vanishing into it.
-        let pad = 3.0;
+        let (w, h) = (w as f64, h as f64);
+        const CEIL: f64 = 50.0;
+        let pad = 2.0;
         let plot_h = (h - 2.0 * pad).max(1.0);
         let y = |v: f64| pad + plot_h * (1.0 - (v / CEIL).clamp(0.0, 1.0));
-        // Faint chart panel so the sparkline reads as *present* even when pressure
-        // is flat-zero (which is most of the time — that's the good state).
-        cr.set_source_rgba(0.5, 0.5, 0.5, 0.07);
-        cr.rectangle(0.0, 0.0, w, h);
-        let _ = cr.fill();
-        // critical-threshold guide
+        // A neutral grey reads in light and dark alike.
         cr.set_line_width(1.0);
-        cr.set_source_rgba(0.5, 0.5, 0.5, 0.22);
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.35);
+        cr.set_dash(&[3.0, 3.0], 0.0);
         cr.move_to(0.0, y(25.0));
         cr.line_to(w, y(25.0));
         let _ = cr.stroke();
+        cr.set_dash(&[], 0.0);
         if data.len() < 2 {
             return;
         }
         let n = data.len();
         let x = |i: usize| w * (i as f64) / ((n - 1) as f64);
         let cur = *data.last().unwrap();
+        // Adwaita's success / warning / error background colours.
         let (r, g, b) = if cur > 25.0 {
-            (0.886, 0.314, 0.290) // crit
+            (0.878, 0.106, 0.141)
         } else if cur > 5.0 {
-            (0.929, 0.722, 0.353) // warn
+            (0.898, 0.647, 0.039)
         } else {
-            (0.337, 0.722, 0.290) // good
+            (0.180, 0.761, 0.494)
         };
-        // filled area under the trace (down to the inset baseline)
         let base = y(0.0);
         cr.move_to(0.0, base);
         for (i, v) in data.iter().enumerate() {
@@ -764,9 +957,8 @@ fn sparkline() -> (gtk::DrawingArea, Rc<RefCell<Vec<f64>>>) {
         }
         cr.line_to(w, base);
         cr.close_path();
-        cr.set_source_rgba(r, g, b, 0.18);
+        cr.set_source_rgba(r, g, b, 0.16);
         let _ = cr.fill();
-        // the trace itself
         cr.move_to(x(0), y(data[0]));
         for (i, v) in data.iter().enumerate().skip(1) {
             cr.line_to(x(i), y(*v));
@@ -776,82 +968,6 @@ fn sparkline() -> (gtk::DrawingArea, Rc<RefCell<Vec<f64>>>) {
         let _ = cr.stroke();
     });
     (area, data)
-}
-
-fn meter_row(caption: &str) -> (gtk::Box, gtk::Label, gtk::ProgressBar) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let cap = gtk::Label::new(Some(caption));
-    cap.add_css_class("caption");
-    cap.set_width_request(58);
-    cap.set_xalign(0.0);
-    let val = gtk::Label::new(Some("—"));
-    val.add_css_class("mono");
-    val.add_css_class("caption");
-    val.set_width_request(120);
-    val.set_xalign(1.0);
-    let m = meter();
-    row.append(&cap);
-    row.append(&val);
-    row.append(&m);
-    (row, val, m)
-}
-
-fn meter() -> gtk::ProgressBar {
-    let pb = gtk::ProgressBar::new();
-    pb.set_show_text(false);
-    pb.set_hexpand(true);
-    pb.set_valign(gtk::Align::Center);
-    pb.add_css_class("meter");
-    pb.add_css_class("good");
-    pb
-}
-
-fn build_action_bar() -> (
-    gtk::Box,
-    gtk::Label,
-    gtk::Button,
-    gtk::Button,
-    gtk::Button,
-    gtk::Button,
-) {
-    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    bar.add_css_class("actionbar");
-    let sel = gtk::Label::new(Some("Select an app to act on it"));
-    sel.add_css_class("selname");
-    sel.set_hexpand(true);
-    sel.set_xalign(0.0);
-    sel.set_ellipsize(pango::EllipsizeMode::End);
-    sel.set_tooltip_text(Some(
-        "The app the buttons on the right will act on. Click a row above to choose it.",
-    ));
-    let pin = gtk::Button::with_label("Pin");
-    let cap = gtk::Button::with_label("Cap");
-    let pause = gtk::Button::with_label("Pause");
-    let close = gtk::Button::with_label("Close");
-    close.add_css_class("destructive-action");
-    // A gap sets the one irreversible action apart from the reversible ones.
-    close.set_margin_start(10);
-
-    // Ordered by escalating consequence — protect → slow → stop → end. Each
-    // carries a plain-language tooltip + accessible description (the action
-    // words alone aren't self-evident).
-    let helps = [
-        (&pin, "Pin (I): keep this app in fast memory so it always stays quick — for something you don't want slowed or paused. The gentlest action."),
-        (&cap, "Cap (C): gently slow this app so it gives back memory it isn't using — without pausing it."),
-        (&pause, "Pause (P): freeze this app so it stops running and can't use more memory. Reversible — Resume wakes it exactly where it was."),
-        (&close, "Close (Delete): quit this app. The only action here you can't undo."),
-    ];
-    for (b, text) in helps {
-        b.set_tooltip_text(Some(text));
-        b.update_property(&[gtk::accessible::Property::Description(text)]);
-        b.set_sensitive(false);
-    }
-    bar.append(&sel);
-    bar.append(&pin);
-    bar.append(&cap);
-    bar.append(&pause);
-    bar.append(&close);
-    (bar, sel, pause, cap, pin, close)
 }
 
 fn parse_apps(reply: &serde_json::Value) -> Vec<App> {
@@ -873,70 +989,107 @@ fn parse_apps(reply: &serde_json::Value) -> Vec<App> {
         .collect()
 }
 
-fn build_row(a: &App, mem_total: u64) -> Row {
-    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+fn build_row(a: &App, look: &Look, mem_total: u64, act: &Rc<dyn Fn(&str, &str)>) -> Row {
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
 
-    let name = gtk::Label::new(None);
-    name.add_css_class("appname");
-    name.set_hexpand(true);
-    name.set_xalign(0.0);
-    name.set_ellipsize(pango::EllipsizeMode::End);
-    name.set_tooltip_text(Some(
-        "The app. Terminal windows show what's running inside them and the folder \
-         it's in. ▲ marks the biggest app rtux can pause — the first it would \
-         pause under pressure (not necessarily the biggest overall, since your \
-         terminals and system apps are off-limits). ❄ marks one rtux has paused.",
-    ));
+    let icon = gtk::Image::new();
+    icon.set_pixel_size(32);
+    icon.add_css_class("app-icon");
+    icon.set_valign(gtk::Align::Center);
+    line.append(&icon);
 
-    let meter = gtk::ProgressBar::new();
-    meter.set_show_text(false);
-    meter.set_valign(gtk::Align::Center);
-    meter.set_width_request(96);
-    meter.add_css_class("meter");
-    meter.set_tooltip_text(Some("The share of your total memory this app is using."));
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    text.set_valign(gtk::Align::Center);
+    let title_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = label("", &["app-title"]);
+    title.set_ellipsize(pango::EllipsizeMode::End);
+    let badge = label("", &["badge"]);
+    badge.set_valign(gtk::Align::Center);
+    title_line.append(&title);
+    title_line.append(&badge);
+    let subtitle = label("", &["app-subtitle"]);
+    subtitle.set_ellipsize(pango::EllipsizeMode::End);
+    text.append(&title_line);
+    text.append(&subtitle);
+    line.append(&text);
 
-    let mem = gtk::Label::new(None);
-    mem.add_css_class("mono");
-    mem.set_width_request(120);
-    mem.set_xalign(1.0);
-    mem.set_tooltip_text(Some(
-        "Memory this app is using now. \"+N\" is how much of it was moved to backup \
-         memory to free up space.",
-    ));
+    let meter = level_bar();
+    meter.set_hexpand(false);
+    meter.set_halign(gtk::Align::End);
+    meter.set_width_request(56);
+    meter.add_css_class("row-meter");
+    meter.set_tooltip_text(Some("This app's share of your total memory."));
+    line.append(&meter);
 
-    let chip = gtk::Label::new(None);
-    chip.add_css_class("chip");
-    chip.set_width_request(64);
-
-    hbox.append(&name);
-    hbox.append(&meter);
-    hbox.append(&mem);
-    hbox.append(&chip);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    actions.add_css_class("row-actions");
+    let btn_pin = icon_button("view-pin-symbolic", "Pin (I): keep this app in fast memory");
+    let btn_cap = icon_button(
+        "power-profile-power-saver-symbolic",
+        "Cap (C): have it give back memory it isn't using, without pausing it",
+    );
+    let btn_pause = icon_button("media-playback-pause-symbolic", "Pause (P): freeze it; Resume wakes it as it was");
+    let btn_close = icon_button("window-close-symbolic", "Close (Delete): quit it; asks first");
+    btn_close.add_css_class("danger");
+    for (b, action) in [(&btn_pin, "pin"), (&btn_cap, "cap"), (&btn_pause, "pause"), (&btn_close, "kill")] {
+        let act = act.clone();
+        let id = a.id.clone();
+        b.connect_clicked(move |_| act(action, &id));
+        actions.append(b);
+    }
+    line.append(&actions);
 
     let root = gtk::ListBoxRow::new();
     root.set_widget_name(&a.id);
-    root.set_child(Some(&hbox));
+    root.set_child(Some(&line));
 
-    let row = Row { root, name, meter, mem, chip };
-    update_row(&row, a, mem_total);
+    let row = Row { root, icon, title, subtitle, meter, badge, btn_pin, btn_cap, btn_pause, btn_close };
+    update_row(&row, a, look, mem_total);
     row
 }
 
-fn update_row(row: &Row, a: &App, mem_total: u64) {
-    // Frozen state wins the marker (it's the more important thing to see); the
-    // ❄ + dim/italic row makes a paused app read as "on ice", never "broken".
-    let label = if a.frozen {
-        format!("❄ {}", a.name)
+fn update_row(row: &Row, a: &App, look: &Look, mem_total: u64) {
+    match &look.icon {
+        Icon::File(p) => row.icon.set_from_file(Some(p)),
+        Icon::Named(n) => {
+            let has = gtk::gdk::Display::default()
+                .map(|d| gtk::IconTheme::for_display(&d).has_icon(n))
+                .unwrap_or(false);
+            row.icon.set_icon_name(Some(if has { n.as_str() } else { "application-x-executable-symbolic" }));
+        }
+    }
+    row.title.set_text(&look.title);
+
+    let mut sub = vec![human_bytes(a.mem)];
+    if a.swap > 0 {
+        sub.push(format!("{} swapped", human_bytes(a.swap)));
+    }
+    if let Some(k) = &look.kind {
+        sub.push(k.clone());
+    }
+    row.subtitle.set_text(&sub.join(" \u{b7} "));
+
+    // A badge only when something is out of the ordinary.
+    let (badge, cls, help) = if a.frozen {
+        ("Paused", "paused", "Paused: frozen and not running. Resume wakes it exactly where it was.")
+    } else if a.protected {
+        ("Pinned", "pinned", "Pinned: kept in fast memory so it stays quick.")
+    } else if !a.freezable {
+        ("System", "system", "A protected system app: rtux won't slow, pause or close it.")
     } else if a.hog {
-        format!("▲ {}", a.name)
+        ("Biggest", "top", "The biggest app rtux could pause: the first it would pause under pressure.")
     } else {
-        a.name.clone()
+        ("", "", "")
     };
-    row.name.set_text(&label);
-    if a.hog {
-        row.root.add_css_class("hog");
-    } else {
-        row.root.remove_css_class("hog");
+    row.badge.set_text(badge);
+    row.badge.set_tooltip_text(Some(help));
+    row.badge.set_visible(!badge.is_empty());
+    for c in ["paused", "pinned", "system", "top"] {
+        row.badge.remove_css_class(c);
+    }
+    if !cls.is_empty() {
+        row.badge.add_css_class(cls);
     }
     if a.frozen {
         row.root.add_css_class("frozen");
@@ -946,42 +1099,57 @@ fn update_row(row: &Row, a: &App, mem_total: u64) {
 
     let share = a.mem as f64 / mem_total as f64;
     row.meter.set_fraction(share.clamp(0.0, 1.0));
-    set_sev(&row.meter, share_sev(share));
+    set_level(&row.meter, share_level(share));
 
-    let mem_txt = if a.swap > 0 {
-        format!("{}  +{}", human_bytes(a.mem), human_bytes(a.swap))
+    // Actions follow the app's state.
+    row.btn_pause.set_icon_name(if a.frozen { "media-playback-start-symbolic" } else { "media-playback-pause-symbolic" });
+    row.btn_pause.set_tooltip_text(Some(if a.frozen {
+        "Resume (P): wake it exactly where it was"
     } else {
-        human_bytes(a.mem)
-    };
-    row.mem.set_text(&mem_txt);
-
-    let (chip_txt, chip_cls, chip_help) = if a.frozen {
-        ("paused", "paused", "Paused by rtux — frozen and not running. Resume wakes it up.")
-    } else if a.protected {
-        ("pinned", "pinned", "Pinned — kept in fast memory so it stays quick.")
-    } else if !a.freezable {
-        ("system", "locked", "A protected system app — rtux won't slow, pause, or close it.")
+        "Pause (P): freeze it; Resume wakes it as it was"
+    }));
+    row.btn_pin.set_tooltip_text(Some(if a.protected {
+        "Unpin (I): stop keeping it in fast memory"
     } else {
-        ("live", "live", "Running normally — you can pin, slow, pause, or close it.")
-    };
-    row.chip.set_text(chip_txt);
-    row.chip.set_tooltip_text(Some(chip_help));
-    for c in ["live", "paused", "pinned", "locked"] {
-        row.chip.remove_css_class(c);
+        "Pin (I): keep this app in fast memory"
+    }));
+    if a.protected {
+        row.btn_pin.add_css_class("accent");
+    } else {
+        row.btn_pin.remove_css_class("accent");
     }
-    row.chip.add_css_class(chip_cls);
+    row.btn_pause.set_sensitive(a.freezable || a.frozen);
+    row.btn_cap.set_sensitive(a.freezable);
+    row.btn_close.set_sensitive(a.freezable);
 
-    // Screen-reader summary for the whole row.
-    let swap_part = if a.swap > 0 {
-        format!(", {} in swap", human_bytes(a.swap))
-    } else {
-        String::new()
-    };
+    let swap_part = if a.swap > 0 { format!(", {} in swap", human_bytes(a.swap)) } else { String::new() };
     row.root.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{}, {}{}, {}",
-        a.name,
+        "{}, {}{}{}",
+        look.title,
         human_bytes(a.mem),
         swap_part,
-        chip_txt
+        if badge.is_empty() { String::new() } else { format!(", {}", badge.to_lowercase()) }
     ))]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_names_map_to_desktop_ids() {
+        assert_eq!(desktop_candidates("app-com.t3tools.T3Code-875826.scope")[0], "com.t3tools.T3Code");
+        assert_eq!(desktop_candidates("app-vicinae-figma\\x2dlinux\\x2dnext-1663810.scope")[0], "figma-linux-next");
+        assert_eq!(desktop_candidates("app-flatpak-app.zen_browser.zen-4243411638.scope")[0], "app.zen_browser.zen");
+        assert_eq!(desktop_candidates("app-gnome-org.gnome.Calculator-123.scope")[0], "org.gnome.Calculator");
+        assert_eq!(desktop_candidates("vicinae.service")[0], "vicinae");
+        assert_eq!(desktop_candidates("snap.firefox.firefox-0b1c.scope")[0], "firefox_firefox");
+    }
+
+    #[test]
+    fn sizes_read_like_gnome() {
+        assert_eq!(human_bytes(4_724_464_025), "4.4 GB");
+        assert_eq!(human_bytes(24_373_000_000), "23 GB");
+        assert_eq!(human_bytes(700 * 1024 * 1024), "700 MB");
+    }
 }

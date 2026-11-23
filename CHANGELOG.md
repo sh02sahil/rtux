@@ -20,6 +20,19 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   the app list, labelled as a preview) through the real daemon-to-session path,
   without touching any app. At most once every 10 seconds.
 
+### Changed
+- **A redesigned control window.** Native GNOME (libadwaita) chrome in the shell
+  prompts' steel grey: a status line in plain words with an icon, three cards
+  for memory, swap and the last minute of pressure, and the apps as a rounded
+  list with each app's own icon and name from its desktop file ("T3 Code",
+  "Zen Browser", "Claude"); T3 Code's agent sessions read "Claude agent", Docker
+  containers by their container name. A badge appears only when something is
+  unusual (Paused, Pinned, System, Biggest). Pin, Cap, Pause and Close sit on the
+  row you point at or select, and Close asks before it acts. When the daemon
+  can't be reached, a status page with Try Again replaces the panel. Every
+  colour is an Adwaita palette colour. `PRESSURED_HUD_SNAPSHOT=file.png` renders
+  the window to a PNG and quits, with keys and actions off (for development).
+
 ### Fixed
 - **Apps launched from Vicinae get their own names.** Scopes named
   `app-vicinae-<app>-<pid>` (from a launch prefix that gives each app its own

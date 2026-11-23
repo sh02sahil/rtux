@@ -21,6 +21,9 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   without touching any app. At most once every 10 seconds.
 
 ### Fixed
+- **Apps launched from Vicinae get their own names.** Scopes named
+  `app-vicinae-<app>-<pid>` (from a launch prefix that gives each app its own
+  scope, as GNOME does) read as the app, not as "Vicinae-...".
 - **"daemon unreachable" until the next login, or forever with lingering.**
   The control socket admitted only the `pressured` group, which a user's
   processes get at their next login. With lingering on, the systemd user

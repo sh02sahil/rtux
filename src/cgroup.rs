@@ -891,8 +891,10 @@ pub fn cgroup_to_app_name(scope: &str) -> String {
         }
     }
 
-    // app-gnome-org.gnome.AppName-12345 or app-gnome-update-notifier-12345
-    if let Some(rest) = s.strip_prefix("app-gnome-") {
+    // app-gnome-org.gnome.AppName-12345 or app-gnome-update-notifier-12345, and
+    // the same shape from other launchers that name scopes like GNOME does
+    // (Vicinae with a scope-making launch prefix: app-vicinae-<app>-<pid>).
+    if let Some(rest) = s.strip_prefix("app-gnome-").or_else(|| s.strip_prefix("app-vicinae-")) {
         let name = strip_trailing_pid(rest);
         // If it contains dots (org.gnome.Foo), take the last segment
         if name.contains('.') {
@@ -971,6 +973,23 @@ pub fn total_ram_bytes() -> Result<u64> {
         }
     }
     bail!("MemTotal not found in /proc/meminfo")
+}
+
+#[cfg(test)]
+mod launcher_name_tests {
+    use super::cgroup_to_app_name;
+
+    #[test]
+    fn vicinae_scopes_are_named_like_gnome_ones() {
+        // What ~/.local/bin/vicinae-app-scope creates (systemd-escaped dashes).
+        assert_eq!(cgroup_to_app_name("app-vicinae-figma\\x2dlinux\\x2dnext-1663810.scope"), "Figma-linux-next");
+        assert_eq!(cgroup_to_app_name("app-vicinae-gnome\\x2dcalculator-2879758.scope"), "Gnome-calculator");
+        // GNOME's own names are unchanged.
+        assert_eq!(
+            cgroup_to_app_name("app-gnome-org.gnome.Calculator-123.scope"),
+            cgroup_to_app_name("app-gnome-org.gnome.Calculator-456.scope")
+        );
+    }
 }
 
 #[cfg(test)]

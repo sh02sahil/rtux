@@ -34,6 +34,8 @@ systemctl disable --now rtux.service 2>/dev/null
 # down first can bring the service with it and muddy the disable above.
 systemctl disable --now pressured.socket 2>/dev/null
 rm -f /etc/systemd/system/rtux.service
+rm -f /etc/systemd/system/rtux.service.d/50-precipice.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/rtux.service.d 2>/dev/null || true
 rm -f /etc/systemd/system/pressured.socket
 rm -f /run/pressured.sock
 rm -f /etc/systemd/system/user@.service.d/50-pressured-oomd.conf

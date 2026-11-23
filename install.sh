@@ -100,6 +100,28 @@ echo "Installing oomd drop-in → /etc/systemd/system/user@.service.d/50-pressur
 install -d -m 0755 /etc/systemd/system/user@.service.d
 install -m 0644 "$REPO/50-pressured-oomd.conf" /etc/systemd/system/user@.service.d/50-pressured-oomd.conf
 
+# What to do at the precipice (swap nearly full): kill the worst background hog
+# (the default), or ask first: open the app list and kill only if nobody acts
+# within the grace period. RTUX_PRECIPICE=ask|kill; unset leaves it as it is.
+PRECIPICE_DROPIN=/etc/systemd/system/rtux.service.d/50-precipice.conf
+case "${RTUX_PRECIPICE:-}" in
+    ask)
+        grace="${RTUX_ASK_GRACE_SECS:-90}"
+        [[ "$grace" =~ ^[0-9]+$ ]] || { echo "error: RTUX_ASK_GRACE_SECS must be a number of seconds"; exit 1; }
+        echo "Precipice policy → ask first (grace ${grace}s): $PRECIPICE_DROPIN"
+        install -d -m 0755 /etc/systemd/system/rtux.service.d
+        printf '[Service]\nEnvironment=RTUX_PRECIPICE=ask\nEnvironment=RTUX_ASK_GRACE_SECS=%s\n' "$grace" \
+            > "$PRECIPICE_DROPIN"
+        chmod 0644 "$PRECIPICE_DROPIN"
+        ;;
+    kill)
+        echo "Precipice policy → kill (default)"
+        rm -f "$PRECIPICE_DROPIN"
+        ;;
+    "") ;;
+    *) echo "error: RTUX_PRECIPICE must be 'ask' or 'kill'"; exit 1 ;;
+esac
+
 echo "Reloading systemd and (re)starting service..."
 systemctl daemon-reload
 # Stop the service before the socket: with Requires=pressured.socket, restarting

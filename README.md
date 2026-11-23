@@ -138,6 +138,23 @@ opens instantly — especially when the machine is struggling and you need it mo
 *(Prefer the terminal? `pressured ctl list` shows the same census; `pressured
 status` gives a quick reading of the pressure.)*
 
+## Being asked before anything is killed
+
+By default, when swap is nearly full and pausing can't help any more, rtux
+stops the least precious background app on its own. To be asked first, the way
+a Mac asks when it runs out of application memory, install with:
+
+```sh
+sudo RTUX_PRECIPICE=ask ./install.sh                 # grace period: 90 seconds
+sudo RTUX_PRECIPICE=ask RTUX_ASK_GRACE_SECS=180 ./install.sh
+```
+
+At that point the control window opens by itself, with every app and its
+memory, and a notification asks you to close what you can spare. If nobody
+does and memory stays that full for the grace period, rtux falls back to
+stopping the biggest background app itself, so a machine left alone is still
+saved. `sudo RTUX_PRECIPICE=kill ./install.sh` switches back.
+
 ## Returning it to the wild (uninstalling)
 
 rtux leaves no trace it can't undo. One script reverses the whole thing — the

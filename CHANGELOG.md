@@ -5,6 +5,18 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Added
+- **Ask before the last-resort kill.** With `RTUX_PRECIPICE=ask` (set by
+  `sudo RTUX_PRECIPICE=ask ./install.sh`, as a drop-in in
+  `/etc/systemd/system/rtux.service.d/`), reaching the precipice (swap past 85%)
+  no longer kills straight away: rtux opens the control window, with every app
+  and a Close button, and sends a critical notification asking you to choose what
+  to close, like macOS's "out of application memory" dialog. Only if the
+  precipice lasts `RTUX_ASK_GRACE_SECS` (default 90) after asking does the
+  ranked kill go ahead, so an unattended machine is still saved. The window is
+  started through your own systemd user manager, outside the daemon's sandbox
+  and memory cap. Freezing is unchanged, and the default stays `kill`.
+
 ## [0.4.0] — keep the compositor off disk
 
 ### Upgrading

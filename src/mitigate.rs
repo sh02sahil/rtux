@@ -168,6 +168,35 @@ fn display_name(path: &Path, fallback: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn precipice_policy_defaults_to_kill() {
+        assert_eq!(PrecipicePolicy::parse(None, None), PrecipicePolicy::Kill);
+        assert_eq!(PrecipicePolicy::parse(Some("kill"), Some("30")), PrecipicePolicy::Kill);
+        assert_eq!(PrecipicePolicy::parse(Some("nonsense"), None), PrecipicePolicy::Kill);
+    }
+
+    #[test]
+    fn precipice_policy_ask_with_bounded_grace() {
+        let ask = |g| PrecipicePolicy::Ask { grace: Duration::from_secs(g) };
+        assert_eq!(PrecipicePolicy::parse(Some(" Ask "), None), ask(90));
+        assert_eq!(PrecipicePolicy::parse(Some("ask"), Some("120")), ask(120));
+        // Out of range or garbage falls back to the default, never to "no grace".
+        assert_eq!(PrecipicePolicy::parse(Some("ask"), Some("0")), ask(90));
+        assert_eq!(PrecipicePolicy::parse(Some("ask"), Some("99999")), ask(90));
+        assert_eq!(PrecipicePolicy::parse(Some("ask"), Some("soon")), ask(90));
+    }
+
+    #[test]
+    fn ask_first_then_wait_then_kill() {
+        let policy = PrecipicePolicy::Ask { grace: Duration::from_secs(90) };
+        let t0 = Instant::now();
+        assert_eq!(ask_decision(policy, None, t0), AskStep::AskNow);
+        assert_eq!(ask_decision(policy, Some(t0), t0 + Duration::from_secs(89)), AskStep::Wait);
+        assert_eq!(ask_decision(policy, Some(t0), t0 + Duration::from_secs(90)), AskStep::Kill);
+        // The kill policy never asks.
+        assert_eq!(ask_decision(PrecipicePolicy::Kill, None, t0), AskStep::Kill);
+    }
+
     // The classification predicates these tests used to exercise (hard_exempt,
     // never_freeze, and the class of a background vs focused session) now live in
     // `crate::classify`, and so do their tests — including the display-label
@@ -355,6 +384,68 @@ const CLAUDE_SESSION_WARN_COUNT: usize = 4;
 /// runaway is still caught at the same speed as before.
 const FREEZE_SETTLE: Duration = Duration::from_secs(10);
 
+/// What to do at the precipice (swap past SWAP_HIGH_WATER), where rtux's last
+/// rung SIGKILLs the worst background hog.
+///
+/// `Ask` puts the user first, like macOS's "Your system has run out of
+/// application memory": it opens the control window (every app, its memory, a
+/// Close button) with a notification, and waits. Only if the precipice outlasts
+/// `grace` (nobody at the keyboard) does it fall back to the ranked kill, so the
+/// session is still saved when the user is away. Freezing is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrecipicePolicy {
+    Kill,
+    Ask { grace: Duration },
+}
+
+const DEFAULT_ASK_GRACE_SECS: u64 = 90;
+
+impl PrecipicePolicy {
+    /// From the service's environment: `RTUX_PRECIPICE=kill` (the default) or
+    /// `ask`, and `RTUX_ASK_GRACE_SECS` (default 90, kept within 10..=3600).
+    pub fn from_env() -> Self {
+        Self::parse(
+            std::env::var("RTUX_PRECIPICE").ok().as_deref(),
+            std::env::var("RTUX_ASK_GRACE_SECS").ok().as_deref(),
+        )
+    }
+
+    pub fn parse(mode: Option<&str>, grace: Option<&str>) -> Self {
+        match mode.map(str::trim) {
+            Some(m) if m.eq_ignore_ascii_case("ask") => {
+                let secs = grace
+                    .and_then(|g| g.trim().parse::<u64>().ok())
+                    .filter(|s| (10..=3600).contains(s))
+                    .unwrap_or(DEFAULT_ASK_GRACE_SECS);
+                Self::Ask { grace: Duration::from_secs(secs) }
+            }
+            _ => Self::Kill,
+        }
+    }
+}
+
+/// The ask gate's three outcomes at the precipice.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AskStep {
+    /// Ask policy, not yet asked this episode: open the window, don't kill.
+    AskNow,
+    /// Asked, still inside the grace period: give the user time.
+    Wait,
+    /// Kill policy, or the grace period ran out: the ranked kill goes ahead.
+    Kill,
+}
+
+/// Pure so it can be tested: what kill_worst does now, given the policy and
+/// when (if ever) this episode's question went out.
+pub fn ask_decision(policy: PrecipicePolicy, asked_at: Option<Instant>, now: Instant) -> AskStep {
+    match (policy, asked_at) {
+        (PrecipicePolicy::Kill, _) => AskStep::Kill,
+        (PrecipicePolicy::Ask { .. }, None) => AskStep::AskNow,
+        (PrecipicePolicy::Ask { grace }, Some(at)) if now.duration_since(at) < grace => AskStep::Wait,
+        (PrecipicePolicy::Ask { .. }, Some(_)) => AskStep::Kill,
+    }
+}
+
 pub struct Mitigator {
     /// (cgroup, display name, backoff level), in freeze order.
     frozen: Vec<(PathBuf, String, u32)>,
@@ -380,11 +471,25 @@ pub struct Mitigator {
     /// the signal to reflect it (see FREEZE_SETTLE). `None` until the first freeze.
     last_freeze: Option<Instant>,
     self_cgroup: Option<PathBuf>,
+    /// Kill at the precipice, or ask the user first (RTUX_PRECIPICE).
+    precipice: PrecipicePolicy,
+    /// When this episode's "choose apps to close" went out. Cleared by recover().
+    asked_at: Option<Instant>,
 }
 
 impl Mitigator {
     pub fn new() -> Self {
+        let precipice = PrecipicePolicy::from_env();
+        match precipice {
+            PrecipicePolicy::Kill => eprintln!("precipice policy: kill (the ranked kill, unasked)"),
+            PrecipicePolicy::Ask { grace } => eprintln!(
+                "precipice policy: ask (open the app list; kill only after {}s without relief)",
+                grace.as_secs()
+            ),
+        }
         Self {
+            precipice,
+            asked_at: None,
             frozen: Vec::new(),
             thawed: HashMap::new(),
             last_thaw: None,
@@ -695,6 +800,24 @@ impl Mitigator {
         if self.killed.len() >= MAX_KILLED {
             return;
         }
+        // Ask policy: the user chooses first; the kill waits out the grace period.
+        let now = Instant::now();
+        match ask_decision(self.precipice, self.asked_at, now) {
+            AskStep::AskNow => {
+                self.asked_at = Some(now);
+                self.ask_user();
+                return;
+            }
+            AskStep::Wait => return,
+            AskStep::Kill => {
+                if let (PrecipicePolicy::Ask { grace }, Some(_)) = (self.precipice, self.asked_at) {
+                    eprintln!(
+                        "no relief {}s after asking; stopping the worst background hog myself",
+                        grace.as_secs()
+                    );
+                }
+            }
+        }
         let candidates = match cgroup::list_freezable_cgroups() {
             Ok(c) => c,
             Err(_) => return,
@@ -783,6 +906,32 @@ impl Mitigator {
         }
     }
 
+    /// The ask policy's question: a critical notification (it punches through
+    /// Do-Not-Disturb, as a kill's does) and the control window itself, so the
+    /// list of apps with their Close buttons is already on screen.
+    fn ask_user(&self) {
+        let grace = match self.precipice {
+            PrecipicePolicy::Ask { grace } => grace.as_secs(),
+            PrecipicePolicy::Kill => 0,
+        };
+        let swap_pct = cgroup::swap_used_fraction() * 100.0;
+        eprintln!(
+            "precipice at swap {:.0}%: asking the user to choose apps to close ({}s before I choose)",
+            swap_pct, grace
+        );
+        crate::events::record(format!("Asked you to choose apps to close (swap {:.0}%)", swap_pct));
+        notify::notify_session(
+            "critical",
+            "Memory is almost full: choose apps to close",
+            &format!(
+                "rtux opened its app list. Close what you can spare. If memory is still \
+                 this full in {} seconds, rtux will stop the biggest background app itself.",
+                grace
+            ),
+        );
+        notify::open_hud_session();
+    }
+
     /// Early, gentle nudge: if a lot of Claude sessions are running, suggest
     /// closing some *before* pressure ever forces a freeze or kill. Debounced so
     /// it fires once per accumulation, and resets when the count drops back.
@@ -847,6 +996,8 @@ impl Mitigator {
         // fresh.
         self.killed.clear();
         self.advised = false;
+        // The next precipice is a new question.
+        self.asked_at = None;
 
         // Hand the hogs back a neutral OOM score. We do NOT restore the -1000 they
         // set for themselves — that self-protection is what left the kernel with

@@ -108,6 +108,30 @@ fn command_for_uid(uid: u32, program: &str, args: &[String]) -> Option<Command> 
     Some(cmd)
 }
 
+/// Open the control window (pressured-hud) in every graphical session, for the
+/// "ask" precipice policy (mitigate::PrecipicePolicy::Ask).
+///
+/// Started as a transient unit of the user's own systemd manager
+/// (`systemd-run --user`), not as our child: a child would inherit this daemon's
+/// sandbox (MemoryDenyWriteExecute, the syscall filter), its cgroup and its
+/// MemoryMax, none of which a GTK window should live under, and the user manager
+/// already carries the session's WAYLAND_DISPLAY. The window is single-instance
+/// (dev.pressured.Hud), so asking while it's open just raises it.
+pub fn open_hud_session() {
+    const HUD: &str = "/usr/local/bin/pressured-hud";
+    if !std::path::Path::new(HUD).exists() {
+        eprintln!("[ask] {HUD} isn't installed; the notification has to do on its own");
+        return;
+    }
+    let args: Vec<String> =
+        ["--user", "--quiet", "--collect", "--", HUD].iter().map(|s| s.to_string()).collect();
+    for mut cmd in session_commands("systemd-run", &args) {
+        if let Err(e) = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            eprintln!("[ask] couldn't open the app list: {e}");
+        }
+    }
+}
+
 /// Like `notify_session`, but to one user only: for a problem that is theirs
 /// alone, such as their own session lacking the socket's group.
 pub fn notify_user(uid: u32, urgency: &str, summary: &str, body: &str) {

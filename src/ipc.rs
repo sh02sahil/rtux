@@ -43,6 +43,11 @@ enum Request {
         #[serde(default)]
         want_mb: Option<u64>,
     },
+    /// Show what the ask precipice policy shows (its critical notification and
+    /// the app list), labelled as a preview, without touching any app: no
+    /// freeze, no kill, no change to the policy's state. Lets the user see the
+    /// real path (root daemon -> their session) without running out of memory.
+    AskPreview,
     /// The GNOME extension's 2s heartbeat: "what's the pressure level?". It asks
     /// the daemon rather than reading /proc itself so that a broken round trip
     /// shows on the tray dot within one tick. When the dot read /proc directly it
@@ -299,7 +304,7 @@ fn handle(stream: UnixStream) -> std::io::Result<()> {
             Request::Ping | Request::Foreground { .. } => "extension",
             Request::Touch => "touch",
             Request::PinSelf { .. } => "hud",
-            Request::List | Request::Act { .. } | Request::Budget { .. } => "ctl",
+            Request::List | Request::Act { .. } | Request::Budget { .. } | Request::AskPreview => "ctl",
         };
         crate::clients::record(uid, kind);
     }
@@ -319,6 +324,7 @@ fn handle(stream: UnixStream) -> std::io::Result<()> {
         // Same trust rule as PinSelf: the kernel's peer, never a client's claim.
         Ok(Request::Touch) => serde_json::to_string(&do_touch(peer_pid)),
         Ok(Request::Budget { want_mb }) => serde_json::to_string(&build_budget(want_mb)),
+        Ok(Request::AskPreview) => serde_json::to_string(&do_ask_preview()),
         Err(e) => serde_json::to_string(&ActReply {
             ok: false,
             msg: format!("bad request: {}", e),
@@ -717,6 +723,35 @@ fn permitted_target(path: &std::path::Path, action: &str) -> bool {
     true
 }
 
+/// `ctl ask-preview`: the ask policy's notification and app list, marked as a
+/// preview. Touches no app. At most once per 10s, so a client in the socket's
+/// group can't flood the desktop with critical notifications.
+fn do_ask_preview() -> ActReply {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 10 {
+        return ActReply { ok: false, msg: "a preview was just shown; try again in a few seconds".into() };
+    }
+    LAST.store(now, Ordering::Relaxed);
+    eprintln!("ask preview requested: showing the notification and the app list (nothing paused or stopped)");
+    crate::notify::notify_session(
+        "critical",
+        "Preview: memory is almost full, choose apps to close",
+        "This is only a preview of rtux's ask mode: nothing was paused or stopped. When it's \
+         real, rtux opens its app list like this and waits for you before stopping anything.",
+    );
+    crate::notify::open_hud_session();
+    ActReply {
+        ok: true,
+        msg: "Showed the ask-mode notification and opened the app list (preview: no app was touched)".into(),
+    }
+}
+
 fn do_act(action: &str, id: &str) -> ActReply {
     let Some(path) = cgroup::resolve_id(id) else {
         return ActReply {
@@ -777,6 +812,20 @@ fn do_act(action: &str, id: &str) -> ActReply {
             ok: false,
             msg: format!("{} failed: {}", action, e),
         },
+    }
+}
+
+#[cfg(test)]
+mod ask_preview_tests {
+    use super::Request;
+
+    #[test]
+    fn ask_preview_request_parses() {
+        // What `pressured ctl ask-preview` sends.
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"ask_preview"}"#),
+            Ok(Request::AskPreview)
+        ));
     }
 }
 

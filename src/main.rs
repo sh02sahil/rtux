@@ -67,7 +67,7 @@ enum Commands {
     },
     /// Query/command the running daemon over its control socket
     Ctl {
-        /// list | history | budget | touch | freeze | thaw | cap | uncap | kill | protect | unprotect
+        /// list | history | budget | touch | ask-preview | freeze | thaw | cap | uncap | kill | protect | unprotect
         action: String,
         /// app id (cgroup path from `ctl list`) — required for all actions except
         /// list/history/budget/touch (touch always addresses the caller's own

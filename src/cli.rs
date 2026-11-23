@@ -67,6 +67,8 @@ pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
         // Self-only: the daemon marks the CALLER's cgroup live via SO_PEERCRED, so
         // this deliberately sends no id — there is nothing to address but yourself.
         "touch" => serde_json::json!({ "cmd": "touch" }),
+        // What ask mode shows at the precipice, as a labelled preview; touches no app.
+        "ask-preview" => serde_json::json!({ "cmd": "ask_preview" }),
         // `budget [MB]` — the id slot carries megabytes, not a cgroup. Read-only.
         "budget" => {
             let want_mb = match id {

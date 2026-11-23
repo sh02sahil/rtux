@@ -100,6 +100,32 @@ echo "Installing oomd drop-in → /etc/systemd/system/user@.service.d/50-pressur
 install -d -m 0755 /etc/systemd/system/user@.service.d
 install -m 0644 "$REPO/50-pressured-oomd.conf" /etc/systemd/system/user@.service.d/50-pressured-oomd.conf
 
+# Group membership reaches a user's processes only after their next login, and
+# with lingering on, their systemd user manager (which opens the app list in ask
+# mode) keeps its old groups until a reboot: the window would say "daemon
+# unreachable". A per-user ACL on the socket works for all of their processes
+# at once, whatever groups those started with. The group stays as well.
+ACL_DROPIN=/etc/systemd/system/pressured.socket.d/50-user-acl.conf
+acl_users=()
+while IFS=: read -r name _ uid _ _ home _; do
+    [[ "$uid" -ge 1000 && "$uid" -lt 65534 && -d "$home" ]] || continue
+    acl_users+=("$name")
+done < <(getent passwd)
+if command -v setfacl >/dev/null 2>&1 && ((${#acl_users[@]})); then
+    install -d -m 0755 /etc/systemd/system/pressured.socket.d
+    {
+        echo "[Socket]"
+        for u in "${acl_users[@]}"; do
+            echo "ExecStartPost=/usr/bin/setfacl -m u:$u:rw /run/pressured.sock"
+        done
+    } > "$ACL_DROPIN"
+    chmod 0644 "$ACL_DROPIN"
+    echo "Socket ACL → ${acl_users[*]} (no new login needed): $ACL_DROPIN"
+else
+    echo "warning: setfacl not found (package acl): desktop users reach the daemon only after"
+    echo "         a new login, or a reboot when lingering is on (loginctl show-user)."
+fi
+
 # What to do at the precipice (swap nearly full): kill the worst background hog
 # (the default), or ask first: open the app list and kill only if nobody acts
 # within the grace period. RTUX_PRECIPICE=ask|kill; unset leaves it as it is.
@@ -128,6 +154,10 @@ systemctl daemon-reload
 # the socket under a live service leaves the daemon holding the old fd.
 systemctl stop rtux.service 2>/dev/null || true
 systemctl enable --now pressured.socket
+# An already-running socket doesn't rerun ExecStartPost: apply the ACL now too.
+if [[ -S /run/pressured.sock ]] && command -v setfacl >/dev/null 2>&1; then
+    for u in "${acl_users[@]}"; do setfacl -m "u:$u:rw" /run/pressured.sock; done
+fi
 systemctl enable rtux.service
 systemctl restart rtux.service
 

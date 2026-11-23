@@ -20,6 +20,15 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   the app list, labelled as a preview) through the real daemon-to-session path,
   without touching any app. At most once every 10 seconds.
 
+### Fixed
+- **"daemon unreachable" until the next login, or forever with lingering.**
+  The control socket admitted only the `pressured` group, which a user's
+  processes get at their next login. With lingering on, the systemd user
+  manager (which ask mode uses to open the app list) keeps its old groups until
+  a reboot. `install.sh` now also gives each desktop user an ACL on the socket,
+  through a `pressured.socket.d` drop-in and right away, so the app list and
+  `pressured ctl` work without logging in again.
+
 ## [0.4.0] — keep the compositor off disk
 
 ### Upgrading

@@ -37,6 +37,8 @@ rm -f /etc/systemd/system/rtux.service
 rm -f /etc/systemd/system/rtux.service.d/50-precipice.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/rtux.service.d 2>/dev/null || true
 rm -f /etc/systemd/system/pressured.socket
+rm -f /etc/systemd/system/pressured.socket.d/50-user-acl.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/pressured.socket.d 2>/dev/null || true
 rm -f /run/pressured.sock
 rm -f /etc/systemd/system/user@.service.d/50-pressured-oomd.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/user@.service.d 2>/dev/null || true

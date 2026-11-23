@@ -16,6 +16,9 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   ranked kill go ahead, so an unattended machine is still saved. The window is
   started through your own systemd user manager, outside the daemon's sandbox
   and memory cap. Freezing is unchanged, and the default stays `kill`.
+- **`pressured ctl ask-preview`** shows what ask mode shows (its notification and
+  the app list, labelled as a preview) through the real daemon-to-session path,
+  without touching any app. At most once every 10 seconds.
 
 ## [0.4.0] — keep the compositor off disk
 
